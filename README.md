@@ -16,6 +16,14 @@ A simple Chrome extension that adds a subtle fullscreen button (⛶) to Instagra
 3. Click **Load unpacked**.
 4. Select this folder.
 
+## Automated build artifacts
+
+Pull requests targeting `main` validate the Manifest V3 file, referenced content-script files, JavaScript syntax, and the packaged ZIP contents.
+
+Every push to `main` also publishes `instabetter-<commit>.zip` in the workflow run's **Artifacts** section. The ZIP contains the unpacked extension files at its root and is retained for 30 days. These build artifacts are not GitHub Releases.
+
+To install an artifact, download and extract the ZIP, then select the extracted folder with **Load unpacked** in `chrome://extensions`.
+
 ## Notes
 
 Instagram changes DOM structure frequently. This extension is intentionally minimal and uses resilient selectors, but may need small updates over time.
