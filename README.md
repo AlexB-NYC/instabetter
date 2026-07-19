@@ -4,10 +4,10 @@ A simple Chrome extension that adds a subtle fullscreen button (⛶) to Instagra
 
 ## What it does
 
-- Adds an unobtrusive button to post/reel media on `instagram.com`.
+- Adds an unobtrusive keyboard-focusable button to visible post/reel media on `instagram.com`.
 - Opens the currently visible image or reel in an immersive fullscreen-style overlay.
 - Works with carousel posts by opening whichever slide is currently visible; you can switch slides in Instagram and reopen fullscreen.
-- Press `Esc` or click outside media to close.
+- Press `Esc`, click the backdrop, or click empty overlay space outside the media to close. Focus returns to the opener when possible.
 
 ## Install (Developer mode)
 
@@ -26,4 +26,4 @@ To install an artifact, download and extract the ZIP, then select the extracted 
 
 ## Notes
 
-Instagram changes DOM structure frequently. This extension is intentionally minimal and uses resilient selectors, but may need small updates over time.
+Instagram changes DOM structure frequently. This extension is intentionally minimal, avoids generated class names, and uses visible media within the nearest post or dialog, but may need small updates over time.
