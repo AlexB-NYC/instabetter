@@ -1,0 +1,147 @@
+name: Build extension artifact
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Validate extension sources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path.cwd().resolve()
+          manifest_path = root / "manifest.json"
+
+          try:
+              manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          except FileNotFoundError as exc:
+              raise SystemExit("manifest.json is missing") from exc
+          except json.JSONDecodeError as exc:
+              raise SystemExit(f"manifest.json is invalid JSON: {exc}") from exc
+
+          if manifest.get("manifest_version") != 3:
+              raise SystemExit("manifest.json must use Manifest V3")
+
+          for field in ("name", "version"):
+              value = manifest.get(field)
+              if not isinstance(value, str) or not value.strip():
+                  raise SystemExit(f"manifest.json field {field!r} must be a non-empty string")
+
+          content_scripts = manifest.get("content_scripts")
+          if not isinstance(content_scripts, list) or not content_scripts:
+              raise SystemExit("manifest.json must declare at least one content script")
+
+          files = {"manifest.json"}
+          javascript_files = set()
+
+          for index, entry in enumerate(content_scripts):
+              if not isinstance(entry, dict):
+                  raise SystemExit(f"content_scripts[{index}] must be an object")
+
+              for kind in ("js", "css"):
+                  paths = entry.get(kind, [])
+                  if not isinstance(paths, list):
+                      raise SystemExit(f"content_scripts[{index}].{kind} must be an array")
+
+                  for raw_path in paths:
+                      if not isinstance(raw_path, str) or not raw_path:
+                          raise SystemExit(f"content_scripts[{index}].{kind} contains an invalid path")
+
+                      path = Path(raw_path)
+                      if path.is_absolute() or ".." in path.parts:
+                          raise SystemExit(f"unsafe extension path: {raw_path}")
+
+                      resolved = (root / path).resolve()
+                      if root not in resolved.parents or not resolved.is_file():
+                          raise SystemExit(f"missing extension file: {raw_path}")
+
+                      normalized = resolved.relative_to(root).as_posix()
+                      files.add(normalized)
+                      if kind == "js":
+                          javascript_files.add(normalized)
+
+          temp_dir = Path(os.environ["RUNNER_TEMP"])
+          (temp_dir / "extension-files.txt").write_text(
+              "\n".join(sorted(files)) + "\n",
+              encoding="utf-8",
+          )
+          (temp_dir / "extension-javascript-files.txt").write_text(
+              "\n".join(sorted(javascript_files)) + "\n",
+              encoding="utf-8",
+          )
+
+          print("Extension files:")
+          for path in sorted(files):
+              print(f"  {path}")
+          PY
+
+          while IFS= read -r file; do
+            [[ -z "$file" ]] || node --check "$file"
+          done < "$RUNNER_TEMP/extension-javascript-files.txt"
+
+      - name: Package unpacked extension
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t extension_files < "$RUNNER_TEMP/extension-files.txt"
+          mkdir -p dist
+
+          short_sha="${GITHUB_SHA:0:12}"
+          archive="dist/instabetter-${short_sha}.zip"
+          git archive --format=zip --output="$archive" HEAD -- "${extension_files[@]}"
+
+          python3 - "$archive" "$RUNNER_TEMP/extension-files.txt" <<'PY'
+          import json
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          archive_path = Path(sys.argv[1])
+          expected = sorted(Path(sys.argv[2]).read_text(encoding="utf-8").splitlines())
+
+          with zipfile.ZipFile(archive_path) as archive:
+              actual = sorted(name for name in archive.namelist() if not name.endswith("/"))
+              if actual != expected:
+                  raise SystemExit(f"archive contents differ: expected {expected}, got {actual}")
+              json.loads(archive.read("manifest.json"))
+
+          print(f"Verified {archive_path} with {len(expected)} files")
+          PY
+
+          sha256sum "$archive"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Upload extension ZIP
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ steps.package.outputs.archive }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
