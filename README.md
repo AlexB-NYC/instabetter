@@ -1,20 +1,29 @@
 # Instagram Better: Fullscreen Button Extension
 
-A simple Chrome extension that adds a subtle fullscreen button (⛶) to Instagram web posts.
+A simple Chrome extension that adds subtle fullscreen (⛶) and download (↓) buttons to Instagram web posts.
 
 ## What it does
 
-- Adds an unobtrusive keyboard-focusable button to visible post/reel media on `instagram.com`.
+- Adds unobtrusive keyboard-focusable fullscreen and download buttons to visible post/reel media on `instagram.com`.
 - Opens the currently visible image or reel in an immersive fullscreen-style overlay.
-- Works with carousel posts by opening whichever slide is currently visible; you can switch slides in Instagram and reopen fullscreen.
+- Works with carousel posts by preserving slide order for fullscreen navigation and indexed media downloads.
 - Press `Esc`, click the backdrop, or click empty overlay space outside the media to close. Focus returns to the opener when possible.
 
 ## Install (Developer mode)
 
 1. Open `chrome://extensions`.
 2. Enable **Developer mode**.
-3. Click **Load unpacked**.
-4. Select this folder.
+3. Run `npm run build`.
+4. Click **Load unpacked**.
+5. Select the generated `dist/` folder, which directly contains the built `manifest.json`. Do not select the repository root unless you are intentionally loading source files during development.
+
+## Build and validation
+
+- Build the unpacked extension: `npm run build`
+- Validate the built manifest and referenced files: `npm run validate:extension`
+- Run JavaScript syntax and helper checks: `npm run validate && npm test`
+
+The production unpacked extension directory is `dist/`. Its Manifest V3 background service worker is emitted as `dist/background.js` and referenced from `dist/manifest.json` as `background.service_worker`.
 
 ## Automated build artifacts
 
