@@ -1,6 +1,8 @@
 (() => {
   const BUTTON_CLASS = 'igfs-toggle-btn';
   const HOST_CLASS = 'igfs-host';
+  const VIDEO_CLASS = 'igfs-fullscreen-video';
+  const ERROR_CLASS = 'igfs-media-error';
   const CARD_SELECTOR = 'article, div[role="dialog"]';
   const OVERLAY_SELECTOR = '.igfs-container';
   const MIN_MEDIA_SIZE = 60;
@@ -9,24 +11,29 @@
   const MAX_SCAN_ROWS = 25;
   const MAX_SNAPSHOT_ROWS = 50;
   const MAX_CANDIDATE_ROWS = 15;
+  const USERNAME_RE = /^[A-Za-z0-9._]+$/;
+  const RESERVED_PATHS = new Set(['p', 'reel', 'reels', 'tv', 'explore', 'stories', 'direct', 'accounts', 'about', 'legal', 'privacy', 'developer']);
 
   let overlay = null;
   let overlayState = null;
-  const cardBindings = new WeakMap();
-  const cardIds = new WeakMap();
-  const lastFingerprints = new WeakMap();
-  const pendingCards = new Map();
   let nextCardId = 1;
   let scanFrame = 0;
   let initialFlushPending = true;
+  let startupWritesAllowed = document.readyState === 'complete' ? false : null;
+  let intersectionObserver = null;
+  let resizeObserver = null;
+  let scrollFallbackFrame = 0;
+
+  const cardBindings = new WeakMap();
+  const cardIds = new WeakMap();
+  const registrations = new WeakMap();
+  const lastFingerprints = new WeakMap();
+  const pendingCards = new Map();
+  const registeredCards = new Set();
+  const deferredLayoutCards = new Set();
 
   function getLogLevel() {
-    try {
-      const level = sessionStorage.getItem(LOG_LEVEL_KEY);
-      return ['info', 'debug', 'off'].includes(level) ? level : 'info';
-    } catch (error) {
-      return 'info';
-    }
+    try { const level = sessionStorage.getItem(LOG_LEVEL_KEY); return ['info', 'debug', 'off'].includes(level) ? level : 'info'; } catch (error) { return 'info'; }
   }
 
   const diagnostics = { level: getLogLevel(), mutation: null };
@@ -34,428 +41,97 @@
   const isInfo = () => diagnostics.level === 'info' || diagnostics.level === 'debug';
   const logInfo = (...args) => { if (isInfo()) console.info(LOG_PREFIX, ...args); };
   const logDebug = (...args) => { if (isDebug()) console.debug(LOG_PREFIX, ...args); };
-  const logError = (operation, card, error) => console.error(LOG_PREFIX, `${operation} failed`, { card_id: card ? getCardId(card) : undefined, error });
+  const logError = (operation, card, error) => console.error(LOG_PREFIX, `${operation} failed`, { card_id: card ? getCardId(card) : undefined, error: error?.message || error });
 
-  function getCardId(card) {
-    if (!cardIds.has(card)) cardIds.set(card, `card-${nextCardId++}`);
-    return cardIds.get(card);
-  }
+  function getCardId(card) { if (!cardIds.has(card)) cardIds.set(card, `card-${nextCardId++}`); return cardIds.get(card); }
+  function isInOverlay(element) { return element instanceof Element && Boolean(element.closest(OVERLAY_SELECTOR)); }
+  function canonicalizeCard(card) { if (!(card instanceof Element) || isInOverlay(card)) return null; if (card.matches('div[role="dialog"]')) return card.querySelector(':scope article') || card; return card; }
+  function findCard(element) { return element instanceof Element ? canonicalizeCard(element.closest(CARD_SELECTOR)) : null; }
+  function getCardType(card) { return card?.matches?.('article') ? 'article' : (card?.matches?.('div[role="dialog"]') ? 'dialog' : card?.tagName?.toLowerCase() || 'unknown'); }
+  function rectIntersection(a, b) { const left = Math.max(a.left, b.left); const right = Math.min(a.right, b.right); const top = Math.max(a.top, b.top); const bottom = Math.min(a.bottom, b.bottom); const width = Math.max(0, right - left); const height = Math.max(0, bottom - top); return { width, height, area: width * height, centerX: left + width / 2, centerY: top + height / 2 }; }
+  function metricsFromRect(rect) { const viewport = getViewportRect(); return { width: Math.round(rect.width), height: Math.round(rect.height), top: Math.round(rect.top), bottom: Math.round(rect.bottom), viewport_area: Math.round(rectIntersection(rect, viewport).area) }; }
+  function getViewportRect() { return { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight, width: window.innerWidth, height: window.innerHeight }; }
+  function viewportState(card) { const rect = card.getBoundingClientRect(); if (!rect.width || !rect.height) return 'no-layout'; const margin = window.innerHeight; if (rect.bottom < -margin) return 'above'; if (rect.top > window.innerHeight + margin) return 'below'; if (rect.bottom < 0 || rect.top > window.innerHeight) return 'near'; return rectIntersection(rect, getViewportRect()).area ? 'visible' : 'near'; }
 
-  function isInOverlay(element) {
-    return element instanceof Element && Boolean(element.closest(OVERLAY_SELECTOR));
-  }
+  function getPostPath(card) { const link = card?.querySelector?.('a[href^="/p/"], a[href^="/reel/"], a[href^="/reels/"], a[href^="/tv/"]'); if (!link) return 'unknown'; try { return new URL(link.getAttribute('href'), location.origin).pathname; } catch (error) { return 'unknown'; } }
+  function usernameFromHref(href) { try { const parts = new URL(href, location.origin).pathname.split('/').filter(Boolean); if (parts.length !== 1) return ''; const value = parts[0]; if (!USERNAME_RE.test(value) || RESERVED_PATHS.has(value.toLowerCase())) return ''; return value.replace(/^\/+|\/+$/g, ''); } catch (error) { return ''; } }
+  function isVisibleElement(element) { const rect = element.getBoundingClientRect(); const style = getComputedStyle(element); return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) >= 0.05; }
+  function detectUsername(card, principalMedia) { const anchors = [...card.querySelectorAll('a[href]')].filter((a) => !isInOverlay(a)); const principalBefore = principalMedia ? (a) => Boolean(a.compareDocumentPosition(principalMedia) & Node.DOCUMENT_POSITION_FOLLOWING) : () => true; const candidates = anchors.map((a, index) => ({ anchor: a, username: usernameFromHref(a.getAttribute('href')), index })).filter((c) => c.username); const header = candidates.filter((c) => principalBefore(c.anchor)); const visibleText = header.find((c) => isVisibleElement(c.anchor) && c.anchor.textContent.trim() === c.username); if (visibleText) return { username: visibleText.username, username_source: 'header-profile-link' }; if (header[0]) return { username: header[0].username, username_source: 'header-profile-link' }; const caption = candidates[0]; return caption ? { username: caption.username, username_source: 'caption-fallback' } : { username: 'unknown', username_source: 'unknown' }; }
+  function isSponsored(card) { return /sponsored/i.test([...card.querySelectorAll('span, div')].slice(0, 40).map((n) => n.textContent || '').join(' ')); }
 
-  function canonicalizeCard(card) {
-    if (!(card instanceof Element) || isInOverlay(card)) return null;
-    if (card.matches('div[role="dialog"]')) {
-      const nestedArticle = card.querySelector(':scope article');
-      if (nestedArticle) return nestedArticle;
-    }
-    return card;
-  }
-
-  function getCardType(card) {
-    if (card?.matches?.('article')) return 'article';
-    if (card?.matches?.('div[role="dialog"]')) return 'dialog';
-    return card?.tagName?.toLowerCase() || 'unknown';
-  }
-
-  function getPostPath(card) {
-    const link = card?.querySelector?.('a[href^="/p/"], a[href^="/reel/"]');
-    if (!link) return '';
-    try { return new URL(link.getAttribute('href'), location.origin).pathname; } catch (error) { return ''; }
-  }
-
-  function findCard(element) {
-    return element instanceof Element ? canonicalizeCard(element.closest(CARD_SELECTOR)) : null;
-  }
-
-  function rectIntersection(a, b) {
-    const left = Math.max(a.left, b.left);
-    const right = Math.min(a.right, b.right);
-    const top = Math.max(a.top, b.top);
-    const bottom = Math.min(a.bottom, b.bottom);
-    const width = Math.max(0, right - left);
-    const height = Math.max(0, bottom - top);
-    return { width, height, area: width * height, centerX: left + width / 2, centerY: top + height / 2 };
-  }
-
-  function evaluateMedia(card) {
-    const viewport = { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight };
+  function mediaCandidates(card, requireViewport) {
     const cardRect = card.getBoundingClientRect();
-    const cardViewportArea = rectIntersection(cardRect, viewport).area;
-    const mediaElements = [...card.querySelectorAll('img, video')];
-    const rejectionCounts = {};
-    const candidates = [];
-    let best = null;
-
-    const addRejection = (reason) => { rejectionCounts[reason] = (rejectionCounts[reason] || 0) + 1; };
-
-    if (!cardViewportArea) {
-      mediaElements.forEach((media) => candidates.push({ tag: media.tagName.toLowerCase(), rejection_reason: 'card-outside-viewport' }));
-      return { media: null, card_metrics: metricsFromRect(cardRect, cardViewportArea), candidate_counts: countMedia(mediaElements, 0), rejection_counts: rejectionCounts, outcome_reason: 'card-outside-viewport', candidates };
-    }
-
-    const cardCenterX = cardRect.left + cardRect.width / 2;
-    const cardCenterY = cardRect.top + cardRect.height / 2;
-    mediaElements.forEach((media) => {
-      const row = { tag: media.tagName.toLowerCase() };
-      let reason = '';
+    const region = cardRect;
+    const viewport = getViewportRect();
+    const center = { x: region.left + region.width / 2, y: region.top + region.height / 2 };
+    const rows = [], candidates = [], rejectionCounts = {};
+    const reject = (reason) => { rejectionCounts[reason] = (rejectionCounts[reason] || 0) + 1; };
+    [...card.querySelectorAll('img, video')].forEach((media) => {
+      const tag = media.tagName.toLowerCase(); const rect = media.getBoundingClientRect(); const row = { tag, width: Math.round(rect.width), height: Math.round(rect.height), top: Math.round(rect.top), bottom: Math.round(rect.bottom) }; let reason = '';
       if (media.closest(`.${BUTTON_CLASS}, ${OVERLAY_SELECTOR}`)) reason = 'extension-ui';
       else if (!media.isConnected) reason = 'disconnected';
-
-      const rect = media.getBoundingClientRect();
-      row.width = Math.round(rect.width); row.height = Math.round(rect.height); row.top = Math.round(rect.top); row.bottom = Math.round(rect.bottom);
+      const style = getComputedStyle(media); row.display = style.display; row.visibility = style.visibility; row.opacity = Number(style.opacity).toFixed(2);
+      if (!reason && (rect.width <= 0 || rect.height <= 0)) reason = 'media-layout-pending';
       if (!reason && (rect.width < MIN_MEDIA_SIZE || rect.height < MIN_MEDIA_SIZE)) reason = 'below-minimum-size';
-      const style = window.getComputedStyle(media);
-      row.display = style.display; row.visibility = style.visibility; row.opacity = Number(style.opacity).toFixed(2);
-      if (!reason && style.display === 'none') reason = 'display-none';
-      if (!reason && style.visibility === 'hidden') reason = 'visibility-hidden';
-      if (!reason && Number(style.opacity) < 0.05) reason = 'opacity-too-low';
-      const viewportIntersection = rectIntersection(rect, viewport);
-      row.viewport_intersection_area = Math.round(viewportIntersection.area);
-      if (!reason && !viewportIntersection.area) reason = 'outside-viewport';
-      const cardArea = rectIntersection(rect, cardRect).area;
+      if (!reason && (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) < 0.05)) reason = 'hidden-media';
+      const cardArea = rectIntersection(rect, region).area; const viewportArea = rectIntersection(rect, viewport).area;
+      row.card_intersection_area = Math.round(cardArea); row.viewport_intersection_area = Math.round(viewportArea);
       if (!reason && !cardArea) reason = 'outside-card';
-      row.rejection_reason = reason || '';
-      candidates.push(row);
-      if (reason) { addRejection(reason); return; }
-
-      const mediaCenterX = rect.left + rect.width / 2;
-      const mediaCenterY = rect.top + rect.height / 2;
-      const score = { media, area: cardArea, centerDistance: Math.hypot(mediaCenterX - cardCenterX, mediaCenterY - cardCenterY) };
-      if (!best || score.area > best.area || (score.area === best.area && score.centerDistance < best.centerDistance)) best = score;
+      if (!reason && requireViewport && !viewportArea) reason = 'outside-viewport';
+      row.rejection_reason = reason; rows.push(row); if (reason) { reject(reason); return; }
+      const mediaCenter = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+      candidates.push({ media, cardArea, viewportArea, centerDistance: Math.hypot(mediaCenter.x - center.x, mediaCenter.y - center.y), tag });
     });
-
-    const eligible = candidates.filter((candidate) => !candidate.rejection_reason).length;
-    return {
-      media: best?.media || null,
-      card_metrics: metricsFromRect(cardRect, cardViewportArea),
-      candidate_counts: countMedia(mediaElements, eligible),
-      rejection_counts: rejectionCounts,
-      outcome_reason: best ? 'media-selected' : (mediaElements.length ? 'no-eligible-media' : 'no-media-elements'),
-      candidates,
-    };
+    candidates.sort((a, b) => (requireViewport ? b.viewportArea - a.viewportArea : b.cardArea - a.cardArea) || a.centerDistance - b.centerDistance);
+    return { best: candidates[0]?.media || null, candidates, rows, rejectionCounts };
   }
+  function findBindableMedia(card) { return card?.isConnected ? mediaCandidates(card, false).best : null; }
+  function findActiveVisibleMedia(card) { return card?.isConnected ? mediaCandidates(card, true).best : null; }
+  function classifyPost(card, selectedMedia = null) { const model = selectedMedia ? buildSlideModel(selectedMedia, card) : null; const media = model?.slides?.length ? model.slides.map((s) => s.media) : mediaCandidates(card, false).candidates.map((c) => c.media); const tags = [...new Set(media.map((m) => m.tagName.toLowerCase()))]; const post_media_type = tags.length > 1 ? 'mixed' : (tags[0] === 'video' ? 'video' : (tags[0] === 'img' ? 'image' : 'unknown')); const slide_count = model?.slides?.length || (media.length ? 1 : 0); return { post_media_type, selected_media_type: selectedMedia ? selectedMedia.tagName.toLowerCase().replace('img', 'image') : 'none', carousel: slide_count > 1 ? 'yes' : (slide_count === 1 ? 'no' : 'unknown'), slide_count: slide_count || 'unknown' }; }
 
-  function metricsFromRect(rect, viewportArea) {
-    return { width: Math.round(rect.width), height: Math.round(rect.height), top: Math.round(rect.top), bottom: Math.round(rect.bottom), viewport_area: Math.round(viewportArea) };
-  }
+  function buildMetadata(card, source, selectedMedia, reason, buttonAction) { const classification = classifyPost(card, selectedMedia); const user = detectUsername(card, selectedMedia || findBindableMedia(card)); return { card_id: getCardId(card), username: user.username, username_source: user.username_source, post_path: getPostPath(card), sponsored: isSponsored(card), ...classification, viewport_state: viewportState(card), scan_trigger: source, button_action: buttonAction, reason }; }
+  function evaluateBindable(card) { const media = findBindableMedia(card); const raw = mediaCandidates(card, false); let reason = 'media-selected'; if (!media) { if (!card.isConnected) reason = 'card-disconnected'; else if (!card.getBoundingClientRect().width || !card.getBoundingClientRect().height) reason = 'card-layout-pending'; else if (raw.rows.some((r) => r.rejection_reason === 'media-layout-pending')) reason = 'media-layout-pending'; else reason = 'no-post-media'; } return { media, card_metrics: metricsFromRect(card.getBoundingClientRect()), candidate_counts: { images: raw.rows.filter((r) => r.tag === 'img').length, videos: raw.rows.filter((r) => r.tag === 'video').length, eligible: raw.candidates.length }, rejection_counts: raw.rejectionCounts, outcome_reason: reason, candidates: raw.rows }; }
 
-  function countMedia(mediaElements, eligible) {
-    return { images: mediaElements.filter((media) => media.tagName === 'IMG').length, videos: mediaElements.filter((media) => media.tagName === 'VIDEO').length, eligible };
-  }
+  function elementContainsRect(element, innerRect) { const rect = element.getBoundingClientRect(); return rect.left <= innerRect.left + 1 && rect.top <= innerRect.top + 1 && rect.right >= innerRect.right - 1 && rect.bottom >= innerRect.bottom - 1; }
+  function findButtonHost(media, card) { const mediaRect = media.getBoundingClientRect(); let current = media.parentElement, best = media.parentElement; while (current && current !== card.parentElement) { if (card.contains(current) && !current.matches('main, section, body') && elementContainsRect(current, mediaRect)) best = current; if (current === card) break; current = current.parentElement; } return best || card; }
+  function getCardButton(card) { const binding = cardBindings.get(card); if (binding?.button?.isConnected && card.contains(binding.button)) return binding.button; return [...card.querySelectorAll(`:scope .${BUTTON_CLASS}`)].find((button) => findCard(button) === card) || null; }
+  function upsertButton(card, media) { const host = findButtonHost(media, card); if (!host) return { action: 'failed', host: null, duplicateCount: 0 }; const binding = cardBindings.get(card); const hadStaleBinding = Boolean(binding?.button && (!binding.button.isConnected || !card.contains(binding.button))); const existingButtons = [...card.querySelectorAll(`:scope .${BUTTON_CLASS}`)].filter((button) => findCard(button) === card); let btn = getCardButton(card); let duplicateCount = 0; existingButtons.forEach((button) => { if (button !== btn) { button.remove(); duplicateCount += 1; } }); let action = btn ? 'retained' : 'inserted'; const previousHost = btn?.parentElement || null; if (!btn) { btn = document.createElement('button'); btn.className = BUTTON_CLASS; btn.type = 'button'; btn.title = 'Fullscreen media'; btn.setAttribute('aria-label', 'Open media in fullscreen'); btn.textContent = '⛶'; btn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); const currentCard = findCard(btn); const currentMedia = currentCard ? findActiveVisibleMedia(currentCard) || findBindableMedia(currentCard) : null; if (currentMedia) openOverlay(currentMedia, currentCard, btn, 'replacement'); }); } btn.dataset.igfsMediaTag = media.tagName.toLowerCase(); if (btn.parentElement !== host) { host.appendChild(btn); if (action !== 'inserted') action = previousHost ? 'moved' : 'rebound'; } if (duplicateCount) action = action === 'retained' ? 'duplicate-buttons-removed' : action; if (hadStaleBinding && action === 'inserted') action = 'stale-binding-cleared+inserted'; if (!host.classList.contains(HOST_CLASS)) host.classList.add(HOST_CLASS); if (getComputedStyle(host).position === 'static') host.style.position = 'relative'; cardBindings.set(card, { button: btn, host }); return { action, host, duplicateCount }; }
 
-  function findBestMedia(card) { return card?.isConnected ? evaluateMedia(card).media : null; }
-
-  function elementContainsRect(element, innerRect) {
-    const rect = element.getBoundingClientRect();
-    return rect.left <= innerRect.left + 1 && rect.top <= innerRect.top + 1 && rect.right >= innerRect.right - 1 && rect.bottom >= innerRect.bottom - 1;
-  }
-
-  function findButtonHost(media, card) {
-    const mediaRect = media.getBoundingClientRect();
-    let current = media.parentElement;
-    let best = media.parentElement;
-    while (current && current !== card.parentElement) {
-      if (card.contains(current) && !current.matches('main, section, body') && elementContainsRect(current, mediaRect)) best = current;
-      if (current === card) break;
-      current = current.parentElement;
-    }
-    return best || card;
-  }
-
-  function getCardButton(card) {
-    const binding = cardBindings.get(card);
-    if (binding?.button?.isConnected && card.contains(binding.button)) return binding.button;
-    return [...card.querySelectorAll(`:scope .${BUTTON_CLASS}`)].find((button) => findCard(button) === card) || null;
-  }
-
-  function upsertButton(card, media) {
-    const host = findButtonHost(media, card);
-    if (!host) return { action: 'failed', host: null, duplicateCount: 0 };
-    const binding = cardBindings.get(card);
-    const hadStaleBinding = Boolean(binding?.button && (!binding.button.isConnected || !card.contains(binding.button)));
-    const existingButtons = [...card.querySelectorAll(`:scope .${BUTTON_CLASS}`)].filter((button) => findCard(button) === card);
-    let btn = getCardButton(card);
-    let duplicateCount = 0;
-    existingButtons.forEach((button) => { if (button !== btn) { button.remove(); duplicateCount += 1; } });
-    let action = btn ? 'retained' : 'inserted';
-    const previousHost = btn?.parentElement || null;
-
-    if (!btn) {
-      btn = document.createElement('button');
-      btn.className = BUTTON_CLASS;
-      btn.type = 'button';
-      btn.title = 'Fullscreen media';
-      btn.setAttribute('aria-label', 'Open media in fullscreen');
-      btn.textContent = '⛶';
-      btn.addEventListener('click', (e) => {
-        e.preventDefault(); e.stopPropagation();
-        const currentCard = findCard(btn);
-        const currentMedia = currentCard ? findBestMedia(currentCard) : null;
-        if (currentMedia) logButtonActivation(currentCard, currentMedia);
-        if (currentMedia) openOverlay(currentMedia, currentCard, btn, 'replacement');
-      });
-    }
-
-    btn.dataset.igfsMediaTag = media.tagName.toLowerCase();
-    if (btn.parentElement !== host) {
-      host.appendChild(btn);
-      if (action !== 'inserted') action = previousHost ? 'moved' : 'rebound';
-    }
-    if (duplicateCount) action = action === 'retained' ? 'duplicate-buttons-removed' : action;
-    if (hadStaleBinding && action === 'inserted') action = 'stale-binding-cleared+inserted';
-    if (!host.classList.contains(HOST_CLASS)) host.classList.add(HOST_CLASS);
-    if (window.getComputedStyle(host).position === 'static') host.style.position = 'relative';
-    cardBindings.set(card, { button: btn, host });
-    return { action, host, duplicateCount };
-  }
-
-  function scanCard(card, source = 'unknown', options = {}) {
-    const canonical = canonicalizeCard(card);
-    if (!canonical) return makeResult(card, source, 'skipped', isInOverlay(card) ? 'card-inside-extension-overlay' : 'noncanonical-card');
-    card = canonical;
-    try {
-      if (!card.isConnected) return makeResult(card, source, 'skipped', 'card-disconnected');
-      const binding = cardBindings.get(card);
-      let staleCleared = false;
-      if (!options.dryRun && binding?.button && (!binding.button.isConnected || !card.contains(binding.button))) { cardBindings.delete(card); staleCleared = true; }
-      const evaluation = evaluateMedia(card);
-      if (!evaluation.media) return makeResult(card, source, 'skipped', evaluation.outcome_reason, evaluation, null, staleCleared ? 'stale-binding-cleared' : 'skipped');
-      const bindingResult = options.dryRun ? { action: getCardButton(card) ? 'retained' : 'skipped', host: findButtonHost(evaluation.media, card), duplicateCount: 0 } : upsertButton(card, evaluation.media);
-      return makeResult(card, source, 'bound', 'media-selected', evaluation, bindingResult.host, bindingResult.action);
-    } catch (error) {
-      logError('scanCard', card, error);
-      return makeResult(card, source, 'error', 'unexpected-error', null, null, 'failed', error);
-    }
-  }
-
-  function makeResult(card, source, status, reason, evaluation = null, host = null, buttonAction = 'skipped', error = null) {
-    const actualCard = card instanceof Element ? card : null;
-    return { card, card_id: actualCard ? getCardId(actualCard) : '', post_path: actualCard ? getPostPath(actualCard) : '', card_type: actualCard ? getCardType(actualCard) : '', source, status, reason, connected: Boolean(actualCard?.isConnected), media_summary: evaluation, host_summary: host ? { tag: host.tagName.toLowerCase() } : null, button_action: buttonAction, error };
-  }
-
-  function resultRow(result) {
-    const metrics = result.media_summary?.card_metrics || {};
-    const counts = result.media_summary?.candidate_counts || {};
-    return { card_id: result.card_id, post_path: result.post_path || result.card_id, card_type: result.card_type, source: result.source, status: result.status, reason: result.reason, connected: result.connected, card_width: metrics.width, card_height: metrics.height, card_top: metrics.top, card_bottom: metrics.bottom, card_viewport_area: metrics.viewport_area, image_count: counts.images || 0, video_count: counts.videos || 0, eligible_candidate_count: counts.eligible || 0, selected_media_tag: result.media_summary?.media?.tagName?.toLowerCase() || '', host_tag: result.host_summary?.tag || '', button_action: result.button_action };
-  }
-
+  function registerCard(card, trigger = 'registration') { const canonical = canonicalizeCard(card); if (!canonical || registrations.has(canonical)) return canonical; const record = { id: getCardId(canonical), observed: false }; registrations.set(canonical, record); registeredCards.add(canonical); if (intersectionObserver) { intersectionObserver.observe(canonical); record.observed = true; } scheduleCardScan(canonical, trigger); return canonical; }
+  function unregisterCard(card) { const record = registrations.get(card); if (!record) return; if (intersectionObserver) intersectionObserver.unobserve(card); if (resizeObserver) resizeObserver.unobserve(card); deferredLayoutCards.delete(card); registeredCards.delete(card); cardBindings.delete(card); registrations.delete(card); }
+  function observeLayout(card, reason) { if (!resizeObserver || reason === 'no-post-media') return; deferredLayoutCards.add(card); resizeObserver.observe(card); }
+  function scanCard(card, source = 'unknown', options = {}) { const canonical = canonicalizeCard(card); if (!canonical) return makeResult(card, source, 'skipped', 'card-disconnected'); card = canonical; try { if (!card.isConnected) return makeResult(card, source, 'deferred', 'card-disconnected'); const binding = cardBindings.get(card); let staleCleared = false; if (!options.dryRun && binding?.button && (!binding.button.isConnected || !card.contains(binding.button))) { cardBindings.delete(card); staleCleared = true; } const evaluation = evaluateBindable(card); if (!evaluation.media) { observeLayout(card, evaluation.outcome_reason); return makeResult(card, source, 'deferred', evaluation.outcome_reason, evaluation, null, staleCleared ? 'stale-binding-cleared' : 'deferred'); } if (resizeObserver) { resizeObserver.unobserve(card); deferredLayoutCards.delete(card); } const bindingResult = options.dryRun ? { action: getCardButton(card) ? 'retained' : 'dry-run', host: findButtonHost(evaluation.media, card), duplicateCount: 0 } : upsertButton(card, evaluation.media); return makeResult(card, source, 'bound', 'media-selected', evaluation, bindingResult.host, bindingResult.action); } catch (error) { logError('scanCard', card, error); return makeResult(card, source, 'error', 'unexpected-error', null, null, 'failed', error); } }
+  function makeResult(card, source, status, reason, evaluation = null, host = null, buttonAction = 'deferred', error = null) { const actualCard = card instanceof Element ? card : null; const selected = evaluation?.media || null; return { card, status, connected: Boolean(actualCard?.isConnected), card_type: actualCard ? getCardType(actualCard) : '', media_summary: evaluation, host_summary: host ? { tag: host.tagName.toLowerCase() } : null, error, ...actualCard ? buildMetadata(actualCard, source, selected, reason, buttonAction) : { card_id: '', username: 'unknown', username_source: 'unknown', post_path: 'unknown', post_media_type: 'unknown', selected_media_type: 'none', carousel: 'unknown', slide_count: 'unknown', viewport_state: 'no-layout', scan_trigger: source, button_action: buttonAction, reason } }; }
+  function resultRow(result) { return { card: result.card_id, username: result.username, post: result.post_path, media: result.post_media_type, selected: result.selected_media_type, carousel: result.carousel, slides: result.slide_count, viewport: result.viewport_state, trigger: result.scan_trigger, action: result.button_action, reason: result.reason }; }
   function fingerprint(result) { return JSON.stringify(resultRow(result)); }
-
-  function flushScans() {
-    scanFrame = 0;
-    const entries = [...pendingCards.entries()];
-    pendingCards.clear();
-    const isInitial = initialFlushPending;
-    initialFlushPending = false;
-    const results = entries.map(([card, sources]) => scanCard(card, [...sources].join(',')));
-    logScanFlush(results, isInitial, diagnostics.mutation);
-    diagnostics.mutation = null;
-  }
-
-  function logScanFlush(results, isInitial, mutationSummary) {
-    if (!results.length) return;
-    const changed = results.filter((result) => { const fp = fingerprint(result); const was = lastFingerprints.get(result.card); if (was !== fp) { lastFingerprints.set(result.card, fp); return true; } return false; });
-    const rows = (isDebug() ? results : changed).map(resultRow);
-    const shouldLog = isDebug() || isInitial || changed.length > 0;
-    if (!shouldLog || !isInfo()) return;
-    const summary = summarizeResults(results);
-    console.groupCollapsed(`${LOG_PREFIX} scan flush ${isInitial ? 'initial' : 'update'}: ${results.length} processed, ${summary.bound} bound, ${summary.skipped} skipped`);
-    console.info('summary', summary);
-    if (mutationSummary && isDebug()) console.debug('mutation_batch', mutationSummary);
-    console.table(rows.slice(0, MAX_SCAN_ROWS));
-    if (rows.length > MAX_SCAN_ROWS) console.info(`${rows.length - MAX_SCAN_ROWS} additional rows omitted`);
-    if (isDebug()) logDebugDetails(changed);
-    console.groupEnd();
-  }
-
-  function summarizeResults(results) {
-    return { trigger_sources: [...new Set(results.flatMap((result) => result.source.split(',')))].filter(Boolean).join(','), cards_processed: results.length, buttons_inserted: results.filter((r) => r.button_action.includes('inserted')).length, existing_bindings_retained: results.filter((r) => r.button_action === 'retained').length, buttons_moved_or_rebound: results.filter((r) => ['moved', 'rebound'].includes(r.button_action)).length, stale_bindings_cleared: results.filter((r) => r.button_action.includes('stale-binding-cleared')).length, cards_skipped: results.filter((r) => r.status === 'skipped').length, errors: results.filter((r) => r.status === 'error').length, bound: results.filter((r) => r.status === 'bound').length, skipped: results.filter((r) => r.status === 'skipped').length };
-  }
-
-  function logDebugDetails(results) {
-    results.forEach((result) => {
-      console.groupCollapsed(`${result.card_id} candidate diagnostics`);
-      console.debug({ card: result.card, selected_media: result.media_summary?.media || null, host: result.host_summary || null });
-      const candidates = result.media_summary?.candidates || [];
-      console.table(candidates.slice(0, MAX_CANDIDATE_ROWS));
-      if (candidates.length > MAX_CANDIDATE_ROWS) console.debug(`${candidates.length - MAX_CANDIDATE_ROWS} additional candidates omitted`);
-      console.groupEnd();
-    });
-  }
-
-  function scheduleCardScan(card, source = 'scheduled') {
-    card = canonicalizeCard(card);
-    if (!card?.isConnected || isInOverlay(card)) return;
-    if (!pendingCards.has(card)) pendingCards.set(card, new Set());
-    pendingCards.get(card).add(source);
-    logDebug('scheduled card scan', { card_id: getCardId(card), post_path: getPostPath(card) || getCardId(card), source });
-    if (!scanFrame) scanFrame = requestAnimationFrame(flushScans);
-  }
-
-  function collectAffectedCards(mutations) {
-    const cards = new Set();
-    const summary = { mutation_records: mutations.length, added_elements: 0, removed_elements: 0, extension_nodes_ignored: 0, canonical_cards_discovered: 0, unique_affected_cards: 0, cards_newly_queued: 0 };
-    mutations.forEach((mutation) => {
-      mutation.removedNodes.forEach((node) => { if (node instanceof Element) summary.removed_elements += 1; });
-      if (mutation.target instanceof Element) { const targetCard = findCard(mutation.target); if (targetCard) cards.add(targetCard); }
-      mutation.addedNodes.forEach((node) => {
-        if (!(node instanceof Element)) return;
-        summary.added_elements += 1;
-        if (isInOverlay(node) || node.classList.contains(BUTTON_CLASS)) { summary.extension_nodes_ignored += 1; return; }
-        const nearest = findCard(node); if (nearest) cards.add(nearest);
-        if (node.matches(CARD_SELECTOR)) { const canonical = canonicalizeCard(node); if (canonical) { cards.add(canonical); summary.canonical_cards_discovered += 1; } }
-        node.querySelectorAll(CARD_SELECTOR).forEach((card) => { const canonical = canonicalizeCard(card); if (canonical) { cards.add(canonical); summary.canonical_cards_discovered += 1; } });
-        if ((node.matches('img, video') || node.querySelector('img, video')) && mutation.target instanceof Element) { const targetCard = findCard(mutation.target); if (targetCard) cards.add(targetCard); }
-      });
-    });
-    [...cards].forEach((card) => { if (!card) cards.delete(card); });
-    summary.unique_affected_cards = cards.size;
-    return { cards, summary };
-  }
-
-  function restoreFocus() { const previousFocus = overlayState?.previousFocus; if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true }); }
-  function pauseActiveVideo() { const video = overlayState?.activeMedia; if (video?.tagName === 'VIDEO') video.pause(); }
-  function closeOverlay(reason = 'close-button') {
-    if (!overlay) return;
-    const state = overlayState;
-    pauseActiveVideo(); document.removeEventListener('keydown', handleOverlayKeydown, true); overlay.remove(); overlay = null;
-    if (state) { document.body.style.overflow = state.previousBodyOverflow; restoreFocus(); logInfo('fullscreen closed', { card_id: state.card_id, slide_count: state.slides.length, active_index: state.activeIndex, media_tag: state.activeMedia?.tagName?.toLowerCase() || '', close_reason: reason }); overlayState = null; }
-  }
-
-  function getFocusableOverlayElements() {
-    if (!overlay) return [];
-    return [...overlay.querySelectorAll('button, [href], input, select, textarea, video[controls], [tabindex]:not([tabindex="-1"])')].filter((element) => !element.disabled && element.getAttribute('aria-hidden') !== 'true');
-  }
-
-  function handleOverlayKeydown(e) {
-    if (!overlay) return;
-    if (e.key === 'Escape') { e.preventDefault(); closeOverlay('escape'); return; }
-    if (e.key === 'ArrowLeft') { e.preventDefault(); renderSlide(overlayState.activeIndex - 1); return; }
-    if (e.key === 'ArrowRight') { e.preventDefault(); renderSlide(overlayState.activeIndex + 1); return; }
-    if (e.key !== 'Tab') return;
-    const focusable = getFocusableOverlayElements();
-    if (!focusable.length) { e.preventDefault(); overlay.focus(); return; }
-    const first = focusable[0]; const last = focusable[focusable.length - 1];
-    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
-    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
-  }
+  function scheduleCardScan(card, source = 'scheduled') { card = canonicalizeCard(card); if (!card || isInOverlay(card)) return; if (!registrations.has(card)) registerCard(card, source); if (!card.isConnected) return; if (!pendingCards.has(card)) pendingCards.set(card, new Set()); pendingCards.get(card).add(source); if (!scanFrame && startupWritesAllowed === true) scanFrame = requestAnimationFrame(flushScans); }
+  function flushScans() { scanFrame = 0; const entries = [...pendingCards.entries()]; pendingCards.clear(); const isInitial = initialFlushPending; initialFlushPending = false; const results = entries.map(([card, sources]) => scanCard(card, [...sources].join(','))); logScanFlush(results, isInitial, diagnostics.mutation); diagnostics.mutation = null; }
+  function summarizeResults(results) { return { trigger_sources: [...new Set(results.flatMap((r) => r.scan_trigger.split(',')))].filter(Boolean).join(','), cards_processed: results.length, buttons_inserted: results.filter((r) => r.button_action.includes('inserted')).length, buttons_moved_or_rebound: results.filter((r) => ['moved', 'rebound'].includes(r.button_action)).length, stale_bindings_cleared: results.filter((r) => r.button_action.includes('stale-binding-cleared')).length, deferred_cards: results.filter((r) => r.status === 'deferred').length, errors: results.filter((r) => r.status === 'error').length, bound: results.filter((r) => r.status === 'bound').length }; }
+  function logScanFlush(results, isInitial, mutationSummary) { if (!results.length) return; const changed = results.filter((result) => { const fp = fingerprint(result); const was = lastFingerprints.get(result.card); if (was !== fp) { lastFingerprints.set(result.card, fp); return true; } return false; }); const rows = (isDebug() ? results : changed).map(resultRow); const shouldLog = isDebug() || isInitial || changed.length > 0; if (!shouldLog || !isInfo()) return; const summary = summarizeResults(results); console.groupCollapsed(`${LOG_PREFIX} scan flush ${isInitial ? 'initial' : 'update'}: ${results.length} processed, ${summary.bound} bound, ${summary.deferred_cards} deferred`); console.info('summary', summary); if (mutationSummary && isDebug()) console.debug('mutation_batch', mutationSummary); console.table(rows.slice(0, MAX_SCAN_ROWS)); if (rows.length > MAX_SCAN_ROWS) console.info(`${rows.length - MAX_SCAN_ROWS} additional rows omitted`); if (isDebug()) logDebugDetails(changed); console.groupEnd(); }
+  function logDebugDetails(results) { results.forEach((result) => { console.groupCollapsed(`${result.card_id} candidate diagnostics`); console.debug({ card: result.card, selected_media: result.media_summary?.media || null, username_source: result.username_source }); console.table((result.media_summary?.candidates || []).slice(0, MAX_CANDIDATE_ROWS)); console.groupEnd(); }); }
 
   function getPrimaryMedia(slide) { return slide.querySelector('video') || slide.querySelector('img'); }
-  function mediaSignature(media) { return [media.currentSrc, media.src, media.getAttribute('src'), media.getAttribute('poster'), media.getAttribute('alt')].join('|'); }
-  function findCarouselContainer(activeMedia, card) { const activeSlide = activeMedia.closest('li'); const list = activeSlide?.parentElement; if (list?.tagName === 'UL' && card?.contains(list)) return list; return null; }
-  function buildSlideModel(activeMedia, card) {
-    const single = { media: activeMedia, alt: activeMedia.getAttribute('alt') || '' };
-    const container = findCarouselContainer(activeMedia, card);
-    if (!container) return { slides: [single], activeIndex: 0 };
-    const items = [...container.children].filter((child) => child.tagName === 'LI');
-    const slides = []; let activeIndex = -1;
-    items.forEach((item) => {
-      const media = getPrimaryMedia(item);
-      if (!media || media.closest(`.${BUTTON_CLASS}, ${OVERLAY_SELECTOR}`)) return;
-      if (media.tagName !== 'IMG' && media.tagName !== 'VIDEO') return;
-      const slide = { media, alt: media.getAttribute('alt') || '' };
-      if (item.contains(activeMedia) || media === activeMedia) activeIndex = slides.length;
-      slides.push(slide);
-    });
-    if (slides.length < 2) return { slides: [single], activeIndex: 0 };
-    if (activeIndex < 0) { const activeSig = mediaSignature(activeMedia); activeIndex = slides.findIndex((slide) => mediaSignature(slide.media) === activeSig); }
-    if (activeIndex < 0) activeIndex = 0;
-    return { slides, activeIndex: Math.min(activeIndex, slides.length - 1) };
-  }
+  function mediaSignature(media) { return [media.currentSrc && !media.currentSrc.startsWith('blob:') ? media.currentSrc : '', media.getAttribute('src')?.startsWith('blob:') ? '' : media.getAttribute('src'), media.getAttribute('poster'), media.getAttribute('alt')].join('|'); }
+  function findCarouselContainer(activeMedia, card) { const activeSlide = activeMedia.closest('li'); const list = activeSlide?.parentElement; return list?.tagName === 'UL' && card?.contains(list) ? list : null; }
+  function buildSlideModel(activeMedia, card) { const single = { media: activeMedia, alt: activeMedia.getAttribute('alt') || '' }; const container = findCarouselContainer(activeMedia, card); if (!container) return { slides: [single], activeIndex: 0 }; const items = [...container.children].filter((child) => child.tagName === 'LI'); const slides = []; let activeIndex = -1; items.forEach((item) => { const media = getPrimaryMedia(item); if (!media || media.closest(`.${BUTTON_CLASS}, ${OVERLAY_SELECTOR}`)) return; if (media.tagName !== 'IMG' && media.tagName !== 'VIDEO') return; if (item.contains(activeMedia) || media === activeMedia) activeIndex = slides.length; slides.push({ media, alt: media.getAttribute('alt') || '' }); }); if (slides.length < 2) return { slides: [single], activeIndex: 0 }; if (activeIndex < 0) { const sig = mediaSignature(activeMedia); activeIndex = slides.findIndex((slide) => mediaSignature(slide.media) === sig); } return { slides, activeIndex: Math.max(0, Math.min(activeIndex, slides.length - 1)) }; }
+  function videoSourceKind(video) { if (video.srcObject) return 'srcObject'; const src = video.currentSrc || video.src || video.getAttribute('src') || ''; if (src.startsWith('blob:')) return 'blob'; if (src) return 'url'; return 'none'; }
+  function cloneImage(slide) { const clone = slide.media.cloneNode(true); clone.removeAttribute('style'); clone.removeAttribute('id'); if (slide.alt) clone.alt = slide.alt; clone.addEventListener('click', (e) => e.stopPropagation()); return clone; }
+  function unmountMountedVideo(record, resumeOriginal = false) { if (!record || record.restored) return; const video = record.video; try { video.pause(); } catch (error) {} video.classList.remove(VIDEO_CLASS); if (record.styleAttribute === null) video.removeAttribute('style'); else video.setAttribute('style', record.styleAttribute); video.controls = record.controls; video.autoplay = record.autoplay; video.loop = record.loop; video.muted = record.muted; video.volume = record.volume; video.playsInline = record.playsInline; video.playbackRate = record.playbackRate; const parent = record.marker?.parentNode || record.parent; if (parent?.isConnected) parent.insertBefore(video, record.marker?.parentNode ? record.marker : record.nextSibling?.parentNode === parent ? record.nextSibling : null); record.marker?.remove(); if (Number.isFinite(record.fullscreenTime)) { try { video.currentTime = record.fullscreenTime; } catch (error) {} } if (resumeOriginal && !record.wasPaused) video.play().catch(() => {}); else video.pause(); record.restored = true; }
+  function unmountActiveVideo(resume = false) { const record = overlayState?.mountedVideo; if (record) { record.fullscreenTime = Number.isFinite(record.video.currentTime) ? record.video.currentTime : record.currentTime; unmountMountedVideo(record, resume); overlayState.mountedVideo = null; } }
+  function showVideoError(message) { if (!overlayState?.mediaWrap) return; const box = document.createElement('div'); box.className = ERROR_CLASS; box.textContent = message || 'This video could not be played in fullscreen.'; overlayState.mediaWrap.appendChild(box); }
+  function mountVideo(slide) { const video = slide.media; const marker = document.createComment('igfs-video-restore'); const record = { video, parent: video.parentNode, nextSibling: video.nextSibling, marker, styleAttribute: video.getAttribute('style'), controls: video.controls, autoplay: video.autoplay, loop: video.loop, muted: video.muted, volume: video.volume, playsInline: video.playsInline, playbackRate: video.playbackRate, currentTime: Number.isFinite(video.currentTime) ? video.currentTime : 0, wasPaused: video.paused, restored: false }; record.parent?.insertBefore(marker, video); overlayState.mediaWrap.appendChild(video); overlayState.mountedVideo = record; video.classList.add(VIDEO_CLASS); video.controls = true; video.playsInline = record.playsInline; video.addEventListener('click', (e) => e.stopPropagation(), { once: true }); const logPayload = () => ({ card_id: overlayState.card_id, username: overlayState.username, source_kind: videoSourceKind(video), render_strategy: 'original-node', ready_state: video.readyState, network_state: video.networkState, intrinsic_video_dimensions: `${video.videoWidth || 0}x${video.videoHeight || 0}`, paused: video.paused, media_error_code: video.error?.code || null }); const onError = () => { console.error(LOG_PREFIX, 'fullscreen video failed', { ...logPayload(), play_result: 'error-event' }); showVideoError('This video could not be played in fullscreen.'); }; video.addEventListener('error', onError, { once: true }); const playPromise = video.play(); if (playPromise?.catch) playPromise.then(() => logInfo('fullscreen video', { ...logPayload(), play_result: 'playing' })).catch((error) => { console.error(LOG_PREFIX, 'fullscreen video failed', { ...logPayload(), play_result: error?.name || 'rejected' }); showVideoError('Browser playback was blocked. Use the video controls to play.'); }); }
+  function renderSlide(index) { if (!overlayState || index < 0 || index >= overlayState.slides.length) return; unmountActiveVideo(false); overlayState.activeIndex = index; overlayState.mediaWrap.replaceChildren(); const slide = overlayState.slides[index]; if (slide.media.tagName === 'VIDEO') { mountVideo(slide); overlayState.activeMedia = slide.media; } else { const media = cloneImage(slide); overlayState.mediaWrap.appendChild(media); overlayState.activeMedia = media; } updateCarouselControls(); }
+  function updateCarouselControls() { const { slides, activeIndex, previousButton, nextButton, counter, liveStatus } = overlayState; const hasMultiple = slides.length > 1; previousButton.hidden = !hasMultiple; nextButton.hidden = !hasMultiple; counter.hidden = !hasMultiple; previousButton.disabled = activeIndex <= 0; nextButton.disabled = activeIndex >= slides.length - 1; const text = `${activeIndex + 1} of ${slides.length}`; counter.textContent = text; counter.setAttribute('aria-label', `Slide ${text}`); liveStatus.textContent = hasMultiple ? `Slide ${text}` : ''; }
+  function closeOverlay(reason = 'close-button') { if (!overlay) return; const state = overlayState; unmountActiveVideo(true); (state?.touchedVideos || []).forEach((record) => unmountMountedVideo(record, true)); document.removeEventListener('keydown', handleOverlayKeydown, true); overlay.remove(); overlay = null; if (state) { document.body.style.overflow = state.previousBodyOverflow; if (state.previousFocus?.isConnected) state.previousFocus.focus({ preventScroll: true }); logInfo('fullscreen closed', { card_id: state.card_id, username: state.username, media_type: state.post_media_type, active_index: state.activeIndex, close_reason: reason }); overlayState = null; } }
+  function getFocusableOverlayElements() { return overlay ? [...overlay.querySelectorAll('button, [href], input, select, textarea, video[controls], [tabindex]:not([tabindex="-1"])')].filter((e) => !e.disabled && e.getAttribute('aria-hidden') !== 'true') : []; }
+  function handleOverlayKeydown(e) { if (!overlay) return; if (e.key === 'Escape') { e.preventDefault(); closeOverlay('escape'); } else if (e.key === 'ArrowLeft') { e.preventDefault(); renderSlide(overlayState.activeIndex - 1); } else if (e.key === 'ArrowRight') { e.preventDefault(); renderSlide(overlayState.activeIndex + 1); } else if (e.key === 'Tab') { const focusable = getFocusableOverlayElements(); if (!focusable.length) { e.preventDefault(); overlay.focus(); return; } const first = focusable[0], last = focusable[focusable.length - 1]; if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); } else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); } } }
+  function openOverlay(mediaEl, card, invokingButton, replacementReason = 'replacement') { if (overlay) closeOverlay(replacementReason); const actualCard = card || findCard(mediaEl); const slideModel = buildSlideModel(mediaEl, actualCard); const meta = buildMetadata(actualCard, 'button', mediaEl, 'media-selected', 'open'); logInfo('fullscreen requested', { card_id: meta.card_id, username: meta.username, post_path: meta.post_path, post_media_type: meta.post_media_type, selected_media_type: meta.selected_media_type, carousel: meta.carousel, slide_count: meta.slide_count, active_index: slideModel.activeIndex, video_source_kind: mediaEl.tagName === 'VIDEO' ? videoSourceKind(mediaEl) : 'none', video_render_strategy: mediaEl.tagName === 'VIDEO' ? 'original-node' : 'sanitized-clone' }); overlayState = { previousBodyOverflow: document.body.style.overflow, previousFocus: invokingButton || (document.activeElement instanceof HTMLElement ? document.activeElement : null), slides: slideModel.slides, activeIndex: slideModel.activeIndex, activeMedia: null, mediaWrap: null, mountedVideo: null, touchedVideos: [], card_id: meta.card_id, username: meta.username, post_media_type: meta.post_media_type }; overlay = document.createElement('div'); overlay.className = 'igfs-container'; overlay.setAttribute('role', 'dialog'); overlay.setAttribute('aria-modal', 'true'); overlay.setAttribute('aria-label', 'Fullscreen Instagram media'); overlay.tabIndex = -1; const wrap = document.createElement('div'); wrap.className = 'igfs-media-wrap'; overlayState.mediaWrap = wrap; const previous = document.createElement('button'); previous.className = 'igfs-carousel-btn igfs-carousel-prev'; previous.type = 'button'; previous.setAttribute('aria-label', 'Show previous slide'); previous.textContent = '‹'; previous.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); renderSlide(overlayState.activeIndex - 1); }); const next = document.createElement('button'); next.className = 'igfs-carousel-btn igfs-carousel-next'; next.type = 'button'; next.setAttribute('aria-label', 'Show next slide'); next.textContent = '›'; next.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); renderSlide(overlayState.activeIndex + 1); }); const counter = document.createElement('div'); counter.className = 'igfs-carousel-counter'; const liveStatus = document.createElement('div'); liveStatus.className = 'igfs-sr-only'; liveStatus.setAttribute('aria-live', 'polite'); const close = document.createElement('button'); close.className = 'igfs-close'; close.type = 'button'; close.setAttribute('aria-label', 'Close fullscreen view'); close.textContent = '×'; Object.assign(overlayState, { previousButton: previous, nextButton: next, counter, liveStatus }); close.addEventListener('click', () => closeOverlay('close-button')); overlay.addEventListener('click', (e) => { if (e.target === overlay || e.target === wrap) closeOverlay('backdrop'); }); overlay.append(wrap, previous, next, counter, liveStatus, close); document.body.appendChild(overlay); document.body.style.overflow = 'hidden'; document.addEventListener('keydown', handleOverlayKeydown, true); renderSlide(overlayState.activeIndex); close.focus({ preventScroll: true }); }
 
-  function cloneSlideMedia(slide) {
-    const clone = slide.media.cloneNode(true);
-    clone.removeAttribute('style'); clone.removeAttribute('id'); clone.querySelectorAll?.('[id]').forEach((element) => element.removeAttribute('id'));
-    if (slide.alt && clone.tagName === 'IMG') clone.alt = slide.alt;
-    if (clone.tagName === 'VIDEO') { clone.controls = true; clone.autoplay = true; clone.loop = true; clone.muted = false; clone.playsInline = true; }
-    clone.addEventListener('click', (e) => e.stopPropagation());
-    return clone;
-  }
-
-  function updateCarouselControls() {
-    const { slides, activeIndex, previousButton, nextButton, counter, liveStatus } = overlayState;
-    const hasMultiple = slides.length > 1;
-    previousButton.hidden = !hasMultiple; nextButton.hidden = !hasMultiple; counter.hidden = !hasMultiple;
-    previousButton.disabled = activeIndex <= 0; nextButton.disabled = activeIndex >= slides.length - 1;
-    const text = `${activeIndex + 1} of ${slides.length}`;
-    counter.textContent = text; counter.setAttribute('aria-label', `Slide ${text}`); liveStatus.textContent = hasMultiple ? `Slide ${text}` : '';
-  }
-
-  function renderSlide(index) {
-    if (!overlayState || index < 0 || index >= overlayState.slides.length) return;
-    pauseActiveVideo(); overlayState.activeIndex = index; overlayState.mediaWrap.replaceChildren(cloneSlideMedia(overlayState.slides[index])); overlayState.activeMedia = overlayState.mediaWrap.firstElementChild; updateCarouselControls();
-    logDebug('fullscreen slide changed', { card_id: overlayState.card_id, active_index: overlayState.activeIndex, slide_count: overlayState.slides.length });
-  }
-
-  function logButtonActivation(card, media) {
-    const slideModel = buildSlideModel(media, card);
-    const rect = media.getBoundingClientRect();
-    logInfo('fullscreen requested', { card_id: getCardId(card), post_path: getPostPath(card) || getCardId(card), selected_media_tag: media.tagName.toLowerCase(), selected_media_dimensions: `${Math.round(rect.width)}x${Math.round(rect.height)}`, carousel_slide_count: slideModel.slides.length, initial_slide_index: slideModel.activeIndex });
-  }
-
-  function openOverlay(mediaEl, card, invokingButton, replacementReason = 'replacement') {
-    if (overlay) closeOverlay(replacementReason);
-    const actualCard = card || findCard(mediaEl);
-    const slideModel = buildSlideModel(mediaEl, actualCard);
-    overlayState = { previousBodyOverflow: document.body.style.overflow, previousFocus: invokingButton || (document.activeElement instanceof HTMLElement ? document.activeElement : null), slides: slideModel.slides, activeIndex: slideModel.activeIndex, activeMedia: null, card_id: actualCard ? getCardId(actualCard) : '' };
-    overlay = document.createElement('div'); overlay.className = 'igfs-container'; overlay.setAttribute('role', 'dialog'); overlay.setAttribute('aria-modal', 'true'); overlay.setAttribute('aria-label', 'Fullscreen Instagram media'); overlay.tabIndex = -1;
-    const wrap = document.createElement('div'); wrap.className = 'igfs-media-wrap'; overlayState.mediaWrap = wrap;
-    const previous = document.createElement('button'); previous.className = 'igfs-carousel-btn igfs-carousel-prev'; previous.type = 'button'; previous.setAttribute('aria-label', 'Show previous slide'); previous.textContent = '‹'; previous.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); renderSlide(overlayState.activeIndex - 1); });
-    const next = document.createElement('button'); next.className = 'igfs-carousel-btn igfs-carousel-next'; next.type = 'button'; next.setAttribute('aria-label', 'Show next slide'); next.textContent = '›'; next.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); renderSlide(overlayState.activeIndex + 1); });
-    const counter = document.createElement('div'); counter.className = 'igfs-carousel-counter';
-    const liveStatus = document.createElement('div'); liveStatus.className = 'igfs-sr-only'; liveStatus.setAttribute('aria-live', 'polite');
-    const close = document.createElement('button'); close.className = 'igfs-close'; close.type = 'button'; close.setAttribute('aria-label', 'Close fullscreen view'); close.textContent = '×';
-    overlayState.previousButton = previous; overlayState.nextButton = next; overlayState.counter = counter; overlayState.liveStatus = liveStatus;
-    close.addEventListener('click', () => closeOverlay('close-button'));
-    overlay.addEventListener('click', (e) => { if (e.target === overlay) closeOverlay('backdrop'); else if (e.target === wrap) closeOverlay('backdrop'); });
-    overlay.appendChild(wrap); overlay.appendChild(previous); overlay.appendChild(next); overlay.appendChild(counter); overlay.appendChild(liveStatus); overlay.appendChild(close);
-    document.body.appendChild(overlay); document.body.style.overflow = 'hidden'; document.addEventListener('keydown', handleOverlayKeydown, true); renderSlide(overlayState.activeIndex); close.focus({ preventScroll: true });
-    logInfo('fullscreen opened', { card_id: overlayState.card_id, slide_count: overlayState.slides.length, active_index: overlayState.activeIndex, media_tag: overlayState.activeMedia?.tagName?.toLowerCase() || '' });
-  }
-
-  function runDiagnosticSnapshot() {
-    const rawCards = [...document.querySelectorAll(CARD_SELECTOR)];
-    const canonicalCards = [...new Set(rawCards.map(canonicalizeCard).filter(Boolean))];
-    const results = canonicalCards.map((card) => scanCard(card, 'manual-diagnostic', { dryRun: true }));
-    const duplicateButtonCount = canonicalCards.reduce((count, card) => count + Math.max(0, [...card.querySelectorAll(`:scope .${BUTTON_CLASS}`)].filter((button) => findCard(button) === card).length - 1), 0);
-    const summary = { canonical_cards: canonicalCards.length, bound_cards: results.filter((result) => getCardButton(result.card)).length, unbound_cards: results.filter((result) => !getCardButton(result.card)).length, cards_outside_viewport: results.filter((result) => result.reason === 'card-outside-viewport').length, cards_with_no_eligible_media: results.filter((result) => result.reason === 'no-eligible-media').length, duplicate_button_count: duplicateButtonCount };
-    console.groupCollapsed(`${LOG_PREFIX} diagnostic snapshot: ${summary.canonical_cards} canonical cards, ${summary.unbound_cards} unbound`);
-    console.info('summary', summary);
-    const rows = results.map(resultRow);
-    console.table(rows.slice(0, MAX_SNAPSHOT_ROWS));
-    if (rows.length > MAX_SNAPSHOT_ROWS) console.info(`${rows.length - MAX_SNAPSHOT_ROWS} additional rows omitted`);
-    if (isDebug()) logDebugDetails(results);
-    console.groupEnd();
-  }
-
-  function logInitialDiscovery(initialCards) {
-    const rawCards = [...document.querySelectorAll(CARD_SELECTOR)];
-    const articleCount = document.querySelectorAll('article').length;
-    const dialogCount = document.querySelectorAll('div[role="dialog"]').length;
-    const canonicalCount = new Set(rawCards.map(canonicalizeCard).filter(Boolean)).size;
-    logInfo(`initial discovery: ${canonicalCount} canonical cards queued`, { raw_card_selector_matches: rawCards.length, article_count: articleCount, dialog_count: dialogCount, canonical_card_count: canonicalCount, discarded_during_canonicalization: rawCards.length - canonicalCount, cards_queued_for_initial_scanning: initialCards.length });
-  }
-
-  function initialize() {
-    const manifest = typeof chrome !== 'undefined' ? chrome.runtime?.getManifest?.() || {} : {};
-    logInfo('initialized', { version: manifest.version || 'unknown', diagnostics_level: diagnostics.level, pathname: location.pathname, ready_state: document.readyState, viewport: `${window.innerWidth}x${window.innerHeight}`, mutation_observer_enabled: true });
-    const observer = new MutationObserver((mutations) => {
-      const { cards, summary } = collectAffectedCards(mutations);
-      if (!cards.size) return;
-      summary.cards_newly_queued = [...cards].filter((card) => !pendingCards.has(card)).length;
-      diagnostics.mutation = summary;
-      logDebug('mutation batch queued cards', summary);
-      cards.forEach((card) => scheduleCardScan(card, 'mutation'));
-    });
-    observer.observe(document.documentElement, { childList: true, subtree: true });
-    document.addEventListener('igfs:diagnose', runDiagnosticSnapshot);
-    const initialCards = [...new Set([...document.querySelectorAll(CARD_SELECTOR)].map(canonicalizeCard).filter(Boolean))];
-    logInitialDiscovery(initialCards);
-    initialCards.forEach((card) => scheduleCardScan(card, 'initial'));
-  }
-
+  function collectAffectedCards(mutations) { const cards = new Set(); const summary = { mutation_records: mutations.length, added_elements: 0, removed_elements: 0, extension_nodes_ignored: 0, canonical_cards_discovered: 0, removed_cards: 0, unique_affected_cards: 0 }; mutations.forEach((mutation) => { if (mutation.target instanceof Element && !isInOverlay(mutation.target)) { const targetCard = findCard(mutation.target); if (targetCard) cards.add(targetCard); } mutation.removedNodes.forEach((node) => { if (!(node instanceof Element)) return; if (isInOverlay(node) || node.classList.contains(BUTTON_CLASS)) { summary.extension_nodes_ignored += 1; return; } registeredCards.forEach((card) => { if (!card.isConnected) { unregisterCard(card); summary.removed_cards += 1; } }); }); mutation.addedNodes.forEach((node) => { if (!(node instanceof Element)) return; summary.added_elements += 1; if (isInOverlay(node) || node.classList.contains(BUTTON_CLASS)) { summary.extension_nodes_ignored += 1; return; } const nearest = findCard(node); if (nearest) cards.add(nearest); if (node.matches(CARD_SELECTOR)) { const c = canonicalizeCard(node); if (c) { registerCard(c, 'mutation'); cards.add(c); summary.canonical_cards_discovered += 1; } } node.querySelectorAll(CARD_SELECTOR).forEach((candidate) => { const c = canonicalizeCard(candidate); if (c) { registerCard(c, 'mutation'); cards.add(c); summary.canonical_cards_discovered += 1; } }); }); }); summary.unique_affected_cards = cards.size; return { cards, summary }; }
+  function runDiagnosticSnapshot() { const canonicalCards = [...new Set([...document.querySelectorAll(CARD_SELECTOR)].map(canonicalizeCard).filter(Boolean))]; canonicalCards.forEach((card) => registerCard(card, 'manual-diagnostic')); const results = canonicalCards.map((card) => scanCard(card, 'manual-diagnostic', { dryRun: true })); const duplicateButtonCount = canonicalCards.reduce((count, card) => count + Math.max(0, [...card.querySelectorAll(`:scope .${BUTTON_CLASS}`)].filter((button) => findCard(button) === card).length - 1), 0); const summary = { total_canonical_cards: canonicalCards.length, registered_cards: registeredCards.size, observed_cards: [...registeredCards].filter((c) => registrations.get(c)?.observed).length, bound_cards: results.filter((r) => getCardButton(r.card)).length, deferred_cards: results.filter((r) => r.status === 'deferred').length, image_posts: results.filter((r) => r.post_media_type === 'image').length, video_posts: results.filter((r) => r.post_media_type === 'video').length, mixed_posts: results.filter((r) => r.post_media_type === 'mixed').length, carousels: results.filter((r) => r.carousel === 'yes').length, single_media_posts: results.filter((r) => r.carousel === 'no').length, unknown_usernames: results.filter((r) => r.username === 'unknown').length, duplicate_buttons: duplicateButtonCount }; console.groupCollapsed(`${LOG_PREFIX} diagnostic snapshot: ${summary.total_canonical_cards} canonical cards, ${summary.deferred_cards} deferred`); console.info('summary', summary); console.table(results.map(resultRow).slice(0, MAX_SNAPSHOT_ROWS)); if (results.length > MAX_SNAPSHOT_ROWS) console.info(`${results.length - MAX_SNAPSHOT_ROWS} additional rows omitted`); console.groupEnd(); }
+  function discoverInitialCards() { const cards = [...new Set([...document.querySelectorAll(CARD_SELECTOR)].map(canonicalizeCard).filter(Boolean))]; if (isInfo()) { console.groupCollapsed(`${LOG_PREFIX} new cards registered: ${cards.length}`); console.table(cards.slice(0, MAX_SCAN_ROWS).map((card) => resultRow(makeResult(card, 'initial', 'registered', 'registered', null, null, 'registered')))); if (cards.length > MAX_SCAN_ROWS) console.info(`${cards.length - MAX_SCAN_ROWS} additional rows omitted`); console.groupEnd(); } cards.forEach((card) => registerCard(card, 'initial')); }
+  function installObservers() { if ('IntersectionObserver' in window) { intersectionObserver = new IntersectionObserver((entries) => { entries.forEach((entry) => { if (entry.isIntersecting || entry.intersectionRatio > 0) scheduleCardScan(entry.target, 'intersection'); }); }, { root: null, rootMargin: '100% 0px', threshold: [0, 0.01] }); registeredCards.forEach((card) => intersectionObserver.observe(card)); } else { window.addEventListener('scroll', () => { if (scrollFallbackFrame) return; scrollFallbackFrame = requestAnimationFrame(() => { scrollFallbackFrame = 0; registeredCards.forEach((card) => { if (['visible', 'near'].includes(viewportState(card))) scheduleCardScan(card, 'scroll-fallback'); }); }); }, { passive: true }); } if ('ResizeObserver' in window) resizeObserver = new ResizeObserver((entries) => entries.forEach((entry) => scheduleCardScan(entry.target, 'resize'))); document.addEventListener('load', (e) => { const card = findCard(e.target); if (card) scheduleCardScan(card, 'media-load'); }, true); ['loadedmetadata', 'canplay'].forEach((event) => document.addEventListener(event, (e) => { const card = findCard(e.target); if (card) scheduleCardScan(card, event); }, true)); const observer = new MutationObserver((mutations) => { const { cards, summary } = collectAffectedCards(mutations); if (!cards.size) return; diagnostics.mutation = summary; cards.forEach((card) => scheduleCardScan(card, 'mutation')); }); observer.observe(document.documentElement, { childList: true, subtree: true }); }
+  function allowStartupWrites() { startupWritesAllowed = true; if (!scanFrame && pendingCards.size) scanFrame = requestAnimationFrame(flushScans); }
+  function initialize() { const manifest = typeof chrome !== 'undefined' ? chrome.runtime?.getManifest?.() || {} : {}; logInfo('initialized', { version: manifest.version || 'unknown', diagnostics_level: diagnostics.level, pathname: location.pathname, ready_state: document.readyState, viewport: `${window.innerWidth}x${window.innerHeight}`, mutation_observer_enabled: true, intersection_observer_enabled: 'IntersectionObserver' in window }); installObservers(); document.addEventListener('igfs:diagnose', runDiagnosticSnapshot); discoverInitialCards(); const afterLoad = () => { if ('requestIdleCallback' in window) requestIdleCallback(allowStartupWrites, { timeout: 1500 }); else setTimeout(allowStartupWrites, 250); }; if (document.readyState === 'complete') afterLoad(); else window.addEventListener('load', afterLoad, { once: true }); }
   initialize();
 })();
