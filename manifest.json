@@ -1,14 +1,26 @@
 {
   "manifest_version": 3,
-  "name": "Instagram Post Fullscreen Button",
+  "name": "Instagram Post Fullscreen and Download Button",
   "version": "1.0.0",
-  "description": "Adds an unobtrusive fullscreen button to Instagram posts (images, reels, and carousels).",
+  "description": "Adds unobtrusive fullscreen and download buttons to Instagram posts (images, reels, and carousels).",
   "content_scripts": [
     {
-      "matches": ["https://www.instagram.com/*"],
-      "js": ["content.js"],
-      "css": ["content.css"],
+      "matches": [
+        "https://www.instagram.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "content.css"
+      ],
       "run_at": "document_idle"
     }
-  ]
+  ],
+  "permissions": [
+    "downloads"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
 }
