@@ -27,3 +27,12 @@ To install an artifact, download and extract the ZIP, then select the extracted 
 ## Notes
 
 Instagram changes DOM structure frequently. This extension is intentionally minimal, avoids generated class names, and uses visible media within the nearest post or dialog, but may need small updates over time.
+
+## Diagnostics
+
+Console diagnostics use the `[IGFS]` prefix and default to concise `info` output. Detailed debug logging is local browser-console output only and sends no data anywhere.
+
+- Enable debug logging: `sessionStorage.setItem('igfs:log-level', 'debug'); location.reload();`
+- Restore default info logging: `sessionStorage.removeItem('igfs:log-level'); location.reload();`
+- Disable non-error diagnostics: `sessionStorage.setItem('igfs:log-level', 'off'); location.reload();`
+- Request a side-effect-free diagnostic snapshot: `document.dispatchEvent(new Event('igfs:diagnose'));`
