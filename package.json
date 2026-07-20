@@ -1,0 +1,6 @@
+{
+  "scripts": {
+    "test": "node tests/download-helpers.test.js",
+    "validate": "node -e \"new Function(require('fs').readFileSync('content.js','utf8')); new Function(require('fs').readFileSync('background.js','utf8')); JSON.parse(require('fs').readFileSync('manifest.json','utf8'))\""
+  }
+}
