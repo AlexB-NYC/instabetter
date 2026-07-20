@@ -1,6 +1,6 @@
 {
   "scripts": {
-    "test": "node tests/download-helpers.test.js && node tests/background-downloads.test.js && node tests/media-routing-static.test.js",
+    "test": "node tests/download-helpers.test.js && node tests/background-downloads.test.js && node tests/media-routing-static.test.js && node tests/fullscreen-playback-static.test.js",
     "validate": "node -e \"new Function(require('fs').readFileSync('content.js','utf8')); new Function(require('fs').readFileSync('background.js','utf8')); JSON.parse(require('fs').readFileSync('manifest.json','utf8'))\"",
     "build": "node scripts/build-extension.js",
     "validate:extension": "node scripts/validate-extension.js dist"

@@ -24,6 +24,6 @@ assert.ok(!/else \{\s*mountVideo/.test(source), 'unknown media cannot fall throu
 assert.ok(/async function buildDownloadItemForSlide\(slide.*?switch \(kind\).*?case 'image': break;.*?case 'video': \{ const resolved = await resolveVideoSource/s.test(source), 'image downloads do not invoke video source resolution');
 assert.ok(/btn\.addEventListener\('click'.*?e\.currentTarget/s.test(source), 'fullscreen handler uses currentTarget');
 assert.ok(/downloadBtn\.addEventListener\('click'.*?e\.currentTarget/s.test(source), 'download handler uses currentTarget');
-assert.ok(/overlayState\.requestId !== requestId \|\| overlayState\.activeKind !== 'video'/.test(source), 'late video source results are gated by request and kind');
+assert.ok(/overlayState\?\.requestId !== requestId/.test(source) && /overlayState\.activeKind !== 'video'/.test(source), 'late video source results are gated by request and kind');
 assert.ok(/const IMAGE_CLASS = 'igfs-fullscreen-image'/.test(source), 'image overlay class exists');
 console.log('media routing static regression tests passed');
