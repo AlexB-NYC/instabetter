@@ -19,6 +19,7 @@ function assertSupportedDownloadUrl(url) {
   let parsed;
   try { parsed = new URL(url); } catch (error) { throw new UnsupportedDownloadSourceError('Invalid download URL.'); }
   if (!['https:', 'data:'].includes(parsed.protocol)) throw new UnsupportedDownloadSourceError(`Unsupported download URL protocol: ${parsed.protocol}`);
+  if (parsed.protocol === 'https:' && ['instagram.com', 'www.instagram.com'].includes(parsed.hostname)) throw new UnsupportedDownloadSourceError('INVALID_MEDIA_URL: Instagram page URLs cannot be downloaded as media.');
 }
 
 function waitForDownloadFinalState(downloadId) {
