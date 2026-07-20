@@ -2,7 +2,7 @@ const assert = require('assert');
 const fs = require('fs');
 const vm = require('vm');
 
-const source = fs.readFileSync('content.js', 'utf8').replace('  initialize();', `  globalThis.__igfsHelpers = { sanitizeFilenamePart, detectPostTimestamp, extensionFromUrl, inferMediaExtension, buildDownloadFilename, decodeHtmlEntitiesOnce, isProgressiveHttpsUrl, normalizeVideoCandidates, resolveVideoSource, assertDownloadableUrl, buildDownloadItemForSlide, normalizeMediaKind, mediaKindFromElement };`);
+const source = fs.readFileSync('content.js', 'utf8').replace('  initialize();', `  globalThis.__igfsHelpers = { sanitizeFilenamePart, detectPostTimestamp, extensionFromUrl, inferMediaExtension, buildDownloadFilename, decodeHtmlEntitiesOnce, isProgressiveHttpsUrl, parseAbsoluteMediaUrl, isInstagramCdnHost, parsePostPermalinkPath, inspectJsonScripts, mediaStore, normalizeVideoCandidates, resolveVideoSource, assertDownloadableUrl, buildDownloadItemForSlide, normalizeMediaKind, mediaKindFromElement };`);
 class Element {}
 class HTMLVideoElement extends Element {}
 class HTMLImageElement extends Element {}
@@ -50,6 +50,22 @@ assert.strictEqual(h.normalizeMediaKind('unknown'), null);
 assert.strictEqual(h.mediaKindFromElement(img), 'image');
 assert.strictEqual(h.mediaKindFromElement(video), 'video');
 
+assert.strictEqual(h.parseAbsoluteMediaUrl(''), null);
+assert.strictEqual(h.parseAbsoluteMediaUrl('   '), null);
+assert.strictEqual(h.parseAbsoluteMediaUrl(undefined), null);
+assert.strictEqual(h.parseAbsoluteMediaUrl(null), null);
+assert.strictEqual(h.parseAbsoluteMediaUrl('unknown'), null);
+assert.strictEqual(h.parseAbsoluteMediaUrl('/'), null);
+assert.strictEqual(h.parseAbsoluteMediaUrl('/p/ABC/'), null);
+assert.strictEqual(h.isProgressiveHttpsUrl('https://www.instagram.com/'), false);
+assert.strictEqual(h.isInstagramCdnHost('instagram.test-region.fna.fbcdn.net'), true);
+assert.strictEqual(h.isInstagramCdnHost('evilfbcdn.net.example.com'), false);
+assert.strictEqual(h.parsePostPermalinkPath('/p/ABC/?x=1'), '/p/ABC/');
+assert.strictEqual(h.parsePostPermalinkPath('/reel/ABC/'), '/reel/ABC/');
+assert.strictEqual(h.parsePostPermalinkPath('/reels/ABC/'), '/reels/ABC/');
+assert.strictEqual(h.parsePostPermalinkPath('unknown'), null);
+
+
 const signed = 'https://scontent.cdninstagram.com/o1/v/t16/f2/m86/AQ.mp4?efg=a%253Dkeep%2525&amp;_nc_ht=scontent&amp;_nc_cat=1&amp;_nc_sid=abc%3Ddef';
 assert.strictEqual(h.decodeHtmlEntitiesOnce(signed).includes('&_nc_ht='), true);
 assert.strictEqual(h.decodeHtmlEntitiesOnce(signed).includes('a%253Dkeep%2525'), true, 'must not double decode nested values');
@@ -64,6 +80,14 @@ const candidates = h.normalizeVideoCandidates([
 ]);
 assert.strictEqual(candidates.length, 2, 'dedupes and excludes dash fragments');
 assert.strictEqual(candidates[0].url, 'https://cdn.example.com/high.mp4?x=1');
+
+
+const videoRecord = { pk: '9000000000000000001', id: '9000000000000000001_123456', code: 'TEST_VIDEO_POST', media_type: 2, user: { username: 'test_account' }, video_versions: [{ type: 101, width: 720, height: 1280, url: 'https://instagram.test-region.fna.fbcdn.net/o1/v/t2/f2/m86/video.mp4?efg=xpv_progressive&_nc_vs=encoded_video_dashinit.mp4_encoded_audio_dashinit.mp4' }], video_dash_manifest: '<MPD><Representation mimeType="video/mp4"></Representation></MPD>', image_versions2: { candidates: [{ url: 'https://instagram.test-region.fna.fbcdn.net/poster.jpg?ig_cache_key=TEST_MEDIA_KEY', width: 720, height: 1280 }] } };
+const jsonScript = { textContent: JSON.stringify({ node: { media: videoRecord }, ad: { items: [videoRecord] }, carousel_media: [videoRecord] }) };
+assert.strictEqual(h.inspectJsonScripts({ querySelectorAll: () => [jsonScript] }, 'test-script') > 0, true);
+assert.strictEqual(h.inspectJsonScripts({ querySelectorAll: () => [jsonScript] }, 'test-script'), 0, 'same script parsed once despite page data-processed ownership');
+assert.strictEqual(h.mediaStore.byShortcode.get('TEST_VIDEO_POST').progressiveVideoCandidates[0].url.includes('video_dashinit.mp4'), true);
+assert.strictEqual(h.isProgressiveHttpsUrl(videoRecord.video_versions[0].url, 'video_versions'), true);
 
 scripts.push({ textContent: '{"video_versions":[{"url":"https:\\/\\/cdn.example.com\\/progressive.mp4?sig=a%253D1\\u0026_nc_sid=x","width":720,"height":1280}],"video_dash_manifest":"<Representation>video-only</Representation>"}' });
 (async () => {
