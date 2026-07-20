@@ -36,3 +36,7 @@ Console diagnostics use the `[IGFS]` prefix and default to concise `info` output
 - Restore default info logging: `sessionStorage.removeItem('igfs:log-level'); location.reload();`
 - Disable non-error diagnostics: `sessionStorage.setItem('igfs:log-level', 'off'); location.reload();`
 - Request a side-effect-free diagnostic snapshot: `document.dispatchEvent(new Event('igfs:diagnose'));`
+
+Diagnostic tables include `username`, `media`, `selected`, `carousel`, and `slides` fields. `username` is the normalized account path detected from a profile link, or `unknown` when a safe semantic source is unavailable. `media` describes the post-sized media found in the card (`image`, `video`, `mixed`, or `unknown`), while `selected` describes the active media chosen for the current scan or fullscreen request. `carousel` reports whether a reliable logical slide list was found, and `slides` is the logical slide count when known.
+
+Diagnostics intentionally never log captions, complete profile hrefs, media source URLs, blob UUIDs, signed CDN URLs, or query strings.
